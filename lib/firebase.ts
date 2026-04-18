@@ -1,9 +1,9 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getFirestore, collection, doc } from 'firebase/firestore';
-import { getAuth } from 'firebase/auth';
+import { initializeAuth, getReactNativePersistence } from 'firebase/auth';
+import ReactNativeAsyncStorage from '@react-native-async-storage/async-storage';
 import { getStorage } from 'firebase/storage';
 
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
   apiKey: "AIzaSyC1jW_Nk7Yteb4ieVnRfVtnEYWLhfmaFSY",
   authDomain: "minirent-97965.firebaseapp.com",
@@ -17,9 +17,13 @@ const firebaseConfig = {
 // Initialize Firebase only if it hasn't been initialized already
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 
-// Initialize services
+// Initialize Auth with persistence for React Native
+const auth = initializeAuth(app, {
+  persistence: getReactNativePersistence(ReactNativeAsyncStorage)
+});
+
+// Initialize other services
 export const db = getFirestore(app);
-export const auth = getAuth(app);
 export const storage = getStorage(app);
 
 // Collection references
@@ -33,5 +37,8 @@ export const unmatchedPaymentsCollection = collection(db, 'unmatchedPayments');
 export const getTenantByPhone = (phone: string) => {
   return doc(db, 'tenants', phone);
 };
+
+// Export auth separately
+export { auth };
 
 export default app;

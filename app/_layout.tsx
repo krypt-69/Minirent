@@ -24,17 +24,16 @@ function RootLayoutNav() {
   }
 
   return (
-    <Stack>
-      <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-      <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
-      <Stack.Screen name="add-property" options={{ title: 'Add Property' }} />
-      <Stack.Screen name="tenant-details" options={{ title: 'Tenant Details' }} />
-      <Stack.Screen name="auto-rent" options={{ title: 'Auto Rent' }} />
-      <Stack.Screen name="unmatched-payments" options={{ title: 'Unmatched Payments' }} />
-      <Stack.Screen name="reports" options={{ title: 'Reports' }} />
-      <Stack.Screen name="settings" options={{ title: 'Settings' }} />
-    </Stack>
-  );
+  <Stack>
+    <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+    <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
+    <Stack.Screen name="add-property" options={{ title: 'Add Property' }} />
+    <Stack.Screen name="tenant-details" options={{ title: 'Tenant Details' }} />
+    <Stack.Screen name="auto-rent" options={{ title: 'Auto Rent' }} />
+    <Stack.Screen name="unmatched-payments" options={{ title: 'Unmatched Payments' }} />
+    <Stack.Screen name="reports" options={{ title: 'Reports' }} />
+  </Stack>
+);
 }
 
 export default function RootLayout() {

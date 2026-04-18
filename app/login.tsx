@@ -40,6 +40,7 @@ export default function LoginScreen() {
         <TextInput
           style={styles.input}
           placeholder="Email"
+          placeholderTextColor="#95a5a6"
           value={email}
           onChangeText={setEmail}
           keyboardType="email-address"
@@ -48,27 +49,35 @@ export default function LoginScreen() {
         <TextInput
           style={styles.input}
           placeholder="Password"
+          placeholderTextColor="#95a5a6"
           value={password}
           onChangeText={setPassword}
           secureTextEntry
         />
         
         <TouchableOpacity 
-          style={styles.button} 
+          style={styles.loginButton} 
           onPress={handleLogin}
           disabled={isLoading}
         >
           {isLoading ? (
             <ActivityIndicator color="white" />
           ) : (
-            <Text style={styles.buttonText}>Login</Text>
+            <Text style={styles.loginButtonText}>Login</Text>
           )}
-          <TouchableOpacity 
-  style={styles.registerButton}
-  onPress={() => router.push('/register')}
->
-  <Text style={styles.registerButtonText}>Create New Account</Text>
-</TouchableOpacity>
+        </TouchableOpacity>
+
+        <View style={styles.divider}>
+          <View style={styles.dividerLine} />
+          <Text style={styles.dividerText}>or</Text>
+          <View style={styles.dividerLine} />
+        </View>
+        
+        <TouchableOpacity 
+          style={styles.registerButton}
+          onPress={() => router.push('/register')}
+        >
+          <Text style={styles.registerButtonText}>Create New Account</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -112,26 +121,46 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 15,
     fontSize: 16,
+    backgroundColor: '#fff',
   },
-  button: {
+  loginButton: {
     backgroundColor: '#27ae60',
     padding: 15,
     borderRadius: 8,
     alignItems: 'center',
     marginTop: 10,
   },
-  buttonText: {
+  loginButtonText: {
     color: 'white',
     fontSize: 16,
     fontWeight: '600',
   },
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 20,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#e0e0e0',
+  },
+  dividerText: {
+    color: '#95a5a6',
+    paddingHorizontal: 10,
+    fontSize: 12,
+  },
   registerButton: {
-  marginTop: 15,
-  padding: 12,
-  alignItems: 'center',
-},
-registerButtonText: {
-  color: '#27ae60',
-  fontSize: 14,
-},
+    backgroundColor: '#27ae60',
+    padding: 15,
+    borderRadius: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#27ae60',
+  },
+  registerButtonText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '600',
+  },
 });

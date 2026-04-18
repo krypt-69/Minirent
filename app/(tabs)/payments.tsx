@@ -1,23 +1,41 @@
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, Modal, FlatList } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, TextInput, Alert, Modal, FlatList, ActivityIndicator } from 'react-native';
 import { useState, useEffect } from 'react';
 import { useRouter } from 'expo-router';
 import { useAuth } from '../../context/AuthContext';
-import { db, tenantsCollection, paymentsCollection, unmatchedPaymentsCollection } from '../../lib/firebase';
+import { db, tenantsCollection, paymentsCollection, propertiesCollection } from '../../lib/firebase';
 import { collection, getDocs, addDoc, query, where, Timestamp, doc, updateDoc } from 'firebase/firestore';
 
 type Tenant = {
   id: string;
   name: string;
   phone: string;
+  propertyId: string;
   propertyName?: string;
   room: string;
   roomCode: string;
   monthlyRent: number;
   balance: number;
-  userId?: string;
 };
 
-type PaymentMethod = 'mpesa' | 'manual' | 'whatsapp';
+type Property = {
+  id: string;
+  name: string;
+  code: string;
+};
+
+type ExtractedData = {
+  transactionCode: string | null;
+  amount: string | null;
+  date: string | null;
+  time: string | null;
+  fullAccountString: string | null;
+  rawText: string;
+};
+
+type RoomCandidate = {
+  value: string;
+  description: string;
+};
 
 export default function PaymentsScreen() {
   const router = useRouter();
@@ -25,18 +43,28 @@ export default function PaymentsScreen() {
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [filteredTenants, setFilteredTenants] = useState<Tenant[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [properties, setProperties] = useState<Property[]>([]);
   const [selectedTenant, setSelectedTenant] = useState<Tenant | null>(null);
   const [amount, setAmount] = useState('');
-  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('manual');
+  const [paymentMethod, setPaymentMethod] = useState<'manual' | 'mpesa'>('manual');
   const [mpesaCode, setMpesaCode] = useState('');
   const [mpesaText, setMpesaText] = useState('');
-  const [showTenantSelector, setShowTenantSelector] = useState(false);
-  const [showTestSMS, setShowTestSMS] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [showTenantSelector, setShowTenantSelector] = useState(false);
+  
+  // Guided matching states
+  const [extractedData, setExtractedData] = useState<ExtractedData | null>(null);
+  const [showCandidatesModal, setShowCandidatesModal] = useState(false);
+  const [roomCandidates, setRoomCandidates] = useState<RoomCandidate[]>([]);
+  const [selectedRoomValue, setSelectedRoomValue] = useState<string | null>(null);
+  const [showPropertySelector, setShowPropertySelector] = useState(false);
+  const [matchedTenants, setMatchedTenants] = useState<Tenant[]>([]);
+  const [confirmationVisible, setConfirmationVisible] = useState(false);
+  const [paymentToConfirm, setPaymentToConfirm] = useState<any>(null);
 
   useEffect(() => {
     if (userId) {
-      loadTenants();
+      loadData();
     }
   }, [userId]);
 
@@ -53,11 +81,12 @@ export default function PaymentsScreen() {
     }
   }, [searchQuery, tenants]);
 
-  const loadTenants = async () => {
+  const loadData = async () => {
     if (!userId) return;
     try {
-      const q = query(tenantsCollection, where('userId', '==', userId));
-      const tenantsSnapshot = await getDocs(q);
+      // Load tenants
+      const tenantsQuery = query(tenantsCollection, where('userId', '==', userId));
+      const tenantsSnapshot = await getDocs(tenantsQuery);
       const tenantsList: Tenant[] = [];
       tenantsSnapshot.forEach((doc) => {
         const data = doc.data();
@@ -65,6 +94,7 @@ export default function PaymentsScreen() {
           id: doc.id,
           name: data.name,
           phone: data.phone,
+          propertyId: data.propertyId,
           room: data.room,
           roomCode: data.roomCode,
           monthlyRent: data.monthlyRent,
@@ -73,55 +103,97 @@ export default function PaymentsScreen() {
       });
       setTenants(tenantsList);
       setFilteredTenants(tenantsList);
+
+      // Load properties
+      const propertiesQuery = query(propertiesCollection, where('userId', '==', userId));
+      const propertiesSnapshot = await getDocs(propertiesQuery);
+      const propertiesList: Property[] = [];
+      propertiesSnapshot.forEach((doc) => {
+        const data = doc.data();
+        propertiesList.push({
+          id: doc.id,
+          name: data.name,
+          code: data.code,
+        });
+      });
+      setProperties(propertiesList);
     } catch (error) {
-      console.error('Error loading tenants:', error);
-      Alert.alert('Error', 'Failed to load tenants');
+      
+      Alert.alert('Error', 'Failed to load data');
     }
   };
 
-  const parseMpesaSMS = (text: string) => {
-    console.log('Parsing SMS:', text);
+  // STEP 1: Extract ONLY reliable fields
+  const extractReliableFields = (text: string): ExtractedData => {
     
-    // Extract transaction code
+    
     const codeMatch = text.match(/^([A-Z0-9]{10,12})\s/);
-    if (codeMatch) {
-      setMpesaCode(codeMatch[1]);
-    }
-    
-    // Extract amount
     const amountMatch = text.match(/(?:Ksh|KES)\s?([\d,]+(?:\.\d{2})?)/i);
-    if (amountMatch) {
-      const extractedAmount = amountMatch[1].replace(/,/g, '');
-      setAmount(extractedAmount);
+    const dateMatch = text.match(/\s(\d{1,2}\/\d{1,2}\/\d{2,4})\s/);
+    const timeMatch = text.match(/(\d{1,2}:\d{2}\s(?:AM|PM))/i);
+    
+    let accountMatch = text.match(/account\s([A-Z0-9#]+)/i);
+    let fullAccountString = accountMatch ? accountMatch[1] : null;
+    
+    if (!fullAccountString) {
+      const refMatch = text.match(/for\s([A-Z0-9#]+)/i);
+      fullAccountString = refMatch ? refMatch[1] : null;
     }
     
-    // Try to find tenant (but don't show alert if not found)
-    const accountMatch = text.match(/account\s([A-Z0-9#]+)/i);
-    if (accountMatch) {
-      const accountRef = accountMatch[1];
-      const roomMatch = accountRef.match(/#[A-Z]+(\d{2})$/i);
-      if (roomMatch) {
-        const roomNumber = roomMatch[1];
-        const tenant = tenants.find(t => {
-          const tenantRoomDigits = t.room.replace(/[^0-9]/g, '');
-          return tenantRoomDigits === roomNumber || t.room === roomNumber;
-        });
-        
-        if (tenant) {
-          setSelectedTenant(tenant);
-          Alert.alert('Tenant Found', `Matched: ${tenant.name}\nRoom: ${tenant.room}`);
-        }
-      }
+    return {
+      transactionCode: codeMatch ? codeMatch[1] : null,
+      amount: amountMatch ? amountMatch[1].replace(/,/g, '') : null,
+      date: dateMatch ? dateMatch[1] : null,
+      time: timeMatch ? timeMatch[1] : null,
+      fullAccountString: fullAccountString,
+      rawText: text,
+    };
+  };
+
+  // STEP 2: Generate room identifier candidates
+  const generateRoomCandidates = (accountString: string | null): RoomCandidate[] => {
+    if (!accountString) return [];
+    
+    const candidates: RoomCandidate[] = [];
+    
+    const last2Digits = accountString.match(/(\d{2})$/);
+    if (last2Digits) {
+      candidates.push({ value: last2Digits[1], description: `Last 2 digits: ${last2Digits[1]}` });
     }
     
-    // Show extracted data summary
-    let summary = '';
-    if (mpesaCode) summary += `Code: ${mpesaCode}\n`;
-    if (amountMatch) summary += `Amount: KES ${amountMatch[1]}\n`;
-    
-    if (summary) {
-      Alert.alert('Extracted Details', summary);
+    const last3 = accountString.slice(-3);
+    if (last3 && last3 !== last2Digits?.[1]) {
+      candidates.push({ value: last3, description: `Last 3 characters: ${last3}` });
     }
+    
+    const allDigits = accountString.match(/\d+/g);
+    if (allDigits && allDigits[0] !== last2Digits?.[1]) {
+      candidates.push({ value: allDigits[0], description: `Full number: ${allDigits[0]}` });
+    }
+    
+    candidates.push({ value: accountString, description: `Full reference: ${accountString}` });
+    
+    return candidates.filter((c, i, self) => 
+      self.findIndex(t => t.value === c.value) === i
+    );
+  };
+
+  // STEP 3: Find tenants by room identifier
+  const findTenantsByRoomIdentifier = (roomValue: string): Tenant[] => {
+    const matched = tenants.filter(tenant => {
+      if (tenant.room === roomValue) return true;
+      if (tenant.roomCode === roomValue) return true;
+      if (tenant.room.endsWith(roomValue)) return true;
+      const tenantDigits = tenant.room.replace(/[^0-9]/g, '');
+      const searchDigits = roomValue.replace(/[^0-9]/g, '');
+      if (tenantDigits === searchDigits && searchDigits.length > 0) return true;
+      return false;
+    });
+    
+    return matched.map(tenant => ({
+      ...tenant,
+      propertyName: properties.find(p => p.id === tenant.propertyId)?.name,
+    }));
   };
 
   const handleMpesaPaste = () => {
@@ -129,96 +201,211 @@ export default function PaymentsScreen() {
       Alert.alert('Error', 'Please paste the M-Pesa SMS');
       return;
     }
-    parseMpesaSMS(mpesaText);
+    
+    const extracted = extractReliableFields(mpesaText);
+    setExtractedData(extracted);
+    
+    if (extracted.amount) {
+      setAmount(extracted.amount);
+    }
+    if (extracted.transactionCode) {
+      setMpesaCode(extracted.transactionCode);
+    }
+    
+    const candidates = generateRoomCandidates(extracted.fullAccountString);
+    setRoomCandidates(candidates);
+    setShowCandidatesModal(true);
   };
 
-  const handleRecordPayment = async () => {
-    console.log('=== RECORD PAYMENT CLICKED ===');
-    console.log('Amount:', amount);
-    console.log('Selected Tenant:', selectedTenant?.name || 'None');
-    console.log('Payment Method:', paymentMethod);
-    console.log('Has mpesaText:', !!mpesaText);
+  const handleSelectRoomCandidate = (candidate: RoomCandidate) => {
+    setSelectedRoomValue(candidate.value);
+    setShowCandidatesModal(false);
     
+    const matched = findTenantsByRoomIdentifier(candidate.value);
+    setMatchedTenants(matched);
+    
+    if (matched.length === 0) {
+      Alert.alert(
+        'No Tenant Found',
+        `No tenant found with room identifier "${candidate.value}".\n\nYou can still record this payment in Unmatched Payments.`,
+        [
+          { text: 'Save to Unmatched', onPress: () => saveToUnmatched() },
+          { text: 'Cancel', style: 'cancel', onPress: () => resetMpesaFlow() },
+        ]
+      );
+    } else if (matched.length === 1) {
+      setSelectedTenant(matched[0]);
+      showConfirmationDialog(matched[0]);
+    } else {
+      // Multiple tenants with same room number across different properties
+      setShowPropertySelector(true);
+    }
+  };
+
+  const handleSelectProperty = (tenant: Tenant) => {
+    setSelectedTenant(tenant);
+    setShowPropertySelector(false);
+    showConfirmationDialog(tenant);
+  };
+
+  const showConfirmationDialog = (tenant: Tenant) => {
+    const paymentAmount = parseFloat(amount);
+    setPaymentToConfirm({
+      tenant,
+      amount: paymentAmount,
+      transactionCode: mpesaCode,
+      newBalance: tenant.balance - paymentAmount,
+    });
+    setConfirmationVisible(true);
+  };
+
+  const saveConfirmedPayment = async () => {
+    if (!paymentToConfirm) return;
+    
+    setIsLoading(true);
+    try {
+      const { tenant, amount: paymentAmount, transactionCode, newBalance } = paymentToConfirm;
+      
+      await addDoc(paymentsCollection, {
+        tenantId: tenant.id,
+        tenantName: tenant.name,
+        roomCode: tenant.roomCode,
+        amount: paymentAmount,
+        date: Timestamp.now(),
+        source: 'mpesa',
+        transactionCode: transactionCode || null,
+        originalText: mpesaText,
+        userId: userId,
+      });
+      
+      const tenantRef = doc(db, 'tenants', tenant.id);
+      await updateDoc(tenantRef, {
+        balance: newBalance,
+        lastPaymentDate: Timestamp.now(),
+      });
+      
+      Alert.alert('Success', `Payment of KES ${paymentAmount.toLocaleString()} recorded for ${tenant.name}\nNew Balance: KES ${newBalance.toLocaleString()}`);
+      
+      setConfirmationVisible(false);
+      resetForm();
+      loadData();
+    } catch (error) {
+      
+      Alert.alert('Error', 'Failed to save payment');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const saveToUnmatched = async () => {
+    if (!extractedData || !amount) return;
+    
+    setIsLoading(true);
+    try {
+      await addDoc(collection(db, 'unmatchedPayments'), {
+        originalText: extractedData.rawText,
+        amount: parseFloat(amount),
+        transactionCode: mpesaCode || null,
+        extractedRoom: selectedRoomValue,
+        date: Timestamp.now(),
+        status: 'pending',
+        userId: userId,
+      });
+      
+      Alert.alert('Unmatched Payment Saved', `Payment saved. You can match it later in Unmatched Payments.`);
+      resetMpesaFlow();
+    } catch (error) {
+      
+      Alert.alert('Error', 'Failed to save payment');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Cancel functions for each step
+  const cancelMpesaFlow = () => {
+    Alert.alert(
+      'Cancel Payment',
+      'Are you sure you want to cancel this payment? All entered data will be lost.',
+      [
+        { text: 'No, Continue', style: 'cancel' },
+        { text: 'Yes, Cancel', style: 'destructive', onPress: resetMpesaFlow }
+      ]
+    );
+  };
+
+  const resetMpesaFlow = () => {
+    setMpesaText('');
+    setMpesaCode('');
+    setAmount('');
+    setExtractedData(null);
+    setSelectedRoomValue(null);
+    setMatchedTenants([]);
+    setSelectedTenant(null);
+    setPaymentToConfirm(null);
+    setShowCandidatesModal(false);
+    setShowPropertySelector(false);
+    setConfirmationVisible(false);
+  };
+
+  const cancelManualSelection = () => {
+    setSelectedTenant(null);
+    setAmount('');
+    setSearchQuery('');
+    setShowTenantSelector(false);
+  };
+
+  // MANUAL PAYMENT HANDLERS
+  const handleManualSelectTenant = () => {
+    setShowTenantSelector(true);
+  };
+
+  const handleManualRecordPayment = async () => {
+    if (!selectedTenant) {
+      Alert.alert('Error', 'Please select a tenant');
+      return;
+    }
     if (!amount || parseFloat(amount) <= 0) {
       Alert.alert('Error', 'Please enter a valid amount');
       return;
     }
-
+    
     setIsLoading(true);
     try {
       const paymentAmount = parseFloat(amount);
+      const newBalance = selectedTenant.balance - paymentAmount;
       
-      // CASE 1: Tenant is selected
-      if (selectedTenant) {
-        console.log('CASE 1: Normal payment with tenant');
-        const newBalance = selectedTenant.balance - paymentAmount;
-        
-        await addDoc(paymentsCollection, {
-          tenantId: selectedTenant.id,
-          tenantName: selectedTenant.name,
-          roomCode: selectedTenant.roomCode,
-          amount: paymentAmount,
-          date: Timestamp.now(),
-          source: paymentMethod,
-          transactionCode: paymentMethod === 'mpesa' ? mpesaCode || null : null,
-          originalText: paymentMethod === 'mpesa' ? mpesaText : null,
-          userId: userId,
-        });
-        
-        const tenantRef = doc(db, 'tenants', selectedTenant.id);
-        await updateDoc(tenantRef, {
-          balance: newBalance,
-          lastPaymentDate: Timestamp.now(),
-        });
-        
-        Alert.alert('Success', `Payment recorded! New Balance: KES ${newBalance.toLocaleString()}`);
-        resetForm();
-        loadTenants();
-      } 
-      // CASE 2: No tenant but have SMS - Save to Unmatched
-      else if (paymentMethod === 'mpesa' && mpesaText) {
-        console.log('CASE 2: No tenant found, saving to unmatched');
-        
-        // Extract room number
-        let extractedRoom = null;
-        const accountMatch = mpesaText.match(/account\s([A-Z0-9#]+)/i);
-        if (accountMatch) {
-          const roomMatch = accountMatch[1].match(/#[A-Z]+(\d{2})$/i);
-          if (roomMatch) {
-            extractedRoom = roomMatch[1];
-          }
-        }
-        
-        const phoneMatch = mpesaText.match(/(07\d{8})/);
-        
-        await addDoc(unmatchedPaymentsCollection, {
-          originalText: mpesaText,
-          amount: paymentAmount,
-          transactionCode: mpesaCode || null,
-          phone: phoneMatch ? phoneMatch[0] : null,
-          extractedRoom: extractedRoom,
-          date: Timestamp.now(),
-          status: 'pending',
-          userId: userId,
-        });
-        
-        console.log('Saved to unmatched successfully');
-        Alert.alert(
-          'Unmatched Payment Saved', 
-          `Payment of KES ${paymentAmount.toLocaleString()} saved to Unmatched Payments.\n\nGo to the Unmatched Payments screen (⚠️ icon) to assign it manually.`
-        );
-        resetForm();
-      } 
-      else {
-        console.log('CASE 3: No conditions met');
-        Alert.alert('Error', 'Please select a tenant or paste a valid SMS');
-      }
+      await addDoc(paymentsCollection, {
+        tenantId: selectedTenant.id,
+        tenantName: selectedTenant.name,
+        roomCode: selectedTenant.roomCode,
+        amount: paymentAmount,
+        date: Timestamp.now(),
+        source: 'manual',
+        userId: userId,
+      });
+      
+      const tenantRef = doc(db, 'tenants', selectedTenant.id);
+      await updateDoc(tenantRef, {
+        balance: newBalance,
+        lastPaymentDate: Timestamp.now(),
+      });
+      
+      Alert.alert('Success', `Payment recorded!\nNew Balance: KES ${newBalance.toLocaleString()}`);
+      resetManualForm();
+      loadData();
     } catch (error) {
-      console.error('Error:', error);
-      Alert.alert('Error', 'Failed: ' + error.message);
+      
+      Alert.alert('Error', 'Failed to record payment');
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const resetManualForm = () => {
+    setSelectedTenant(null);
+    setAmount('');
+    setSearchQuery('');
   };
 
   const resetForm = () => {
@@ -228,6 +415,10 @@ export default function PaymentsScreen() {
     setMpesaCode('');
     setMpesaText('');
     setSearchQuery('');
+    setExtractedData(null);
+    setSelectedRoomValue(null);
+    setMatchedTenants([]);
+    setPaymentToConfirm(null);
   };
 
   const renderTenantItem = ({ item }: { item: Tenant }) => (
@@ -247,7 +438,7 @@ export default function PaymentsScreen() {
   );
 
   return (
-    <ScrollView style={styles.container}>
+    <ScrollView style={styles.container} showsVerticalScrollIndicator={false}>
       <View style={styles.header}>
         <TouchableOpacity onPress={() => router.back()} style={styles.backButton}>
           <Text style={styles.backText}>← Back</Text>
@@ -256,49 +447,58 @@ export default function PaymentsScreen() {
         <View style={{ width: 40 }} />
       </View>
 
-      {/* Tenant Selection */}
-      <View style={styles.card}>
-        <Text style={styles.label}>Select Tenant *</Text>
-        <TouchableOpacity 
-          style={styles.selectorButton}
-          onPress={() => setShowTenantSelector(true)}
-        >
-          <Text style={styles.selectorText}>
-            {selectedTenant ? `${selectedTenant.name} (${selectedTenant.roomCode})` : 'Choose a tenant'}
-          </Text>
-        </TouchableOpacity>
-        
-        {selectedTenant && (
-          <View style={styles.selectedInfo}>
-            <Text style={styles.infoText}>Room: {selectedTenant.roomCode}</Text>
-            <Text style={styles.infoText}>Current Balance: KES {selectedTenant.balance.toLocaleString()}</Text>
-            <Text style={[styles.infoText, styles.rentText]}>
-              Monthly Rent: KES {selectedTenant.monthlyRent.toLocaleString()}
-            </Text>
-          </View>
-        )}
-      </View>
-
       {/* Payment Method Tabs */}
       <View style={styles.card}>
         <Text style={styles.label}>Payment Method</Text>
         <View style={styles.tabContainer}>
           <TouchableOpacity 
             style={[styles.tab, paymentMethod === 'manual' && styles.activeTab]}
-            onPress={() => setPaymentMethod('manual')}
+            onPress={() => {
+              setPaymentMethod('manual');
+              resetMpesaFlow();
+            }}
           >
             <Text style={[styles.tabText, paymentMethod === 'manual' && styles.activeTabText]}>Manual</Text>
           </TouchableOpacity>
           <TouchableOpacity 
             style={[styles.tab, paymentMethod === 'mpesa' && styles.activeTab]}
-            onPress={() => setPaymentMethod('mpesa')}
+            onPress={() => {
+              setPaymentMethod('mpesa');
+              resetManualForm();
+            }}
           >
             <Text style={[styles.tabText, paymentMethod === 'mpesa' && styles.activeTabText]}>M-Pesa SMS</Text>
           </TouchableOpacity>
         </View>
 
+        {/* MANUAL PAYMENT */}
         {paymentMethod === 'manual' && (
           <View>
+            <TouchableOpacity 
+              style={styles.selectorButton}
+              onPress={handleManualSelectTenant}
+            >
+              <Text style={styles.selectorText}>
+                {selectedTenant ? `${selectedTenant.name} (${selectedTenant.roomCode})` : 'Select Tenant *'}
+              </Text>
+            </TouchableOpacity>
+            
+            {selectedTenant && (
+              <>
+                <View style={styles.selectedInfo}>
+                  <Text style={styles.infoText}>Room: {selectedTenant.roomCode}</Text>
+                  <Text style={styles.infoText}>Monthly Rent: KES {selectedTenant.monthlyRent.toLocaleString()}</Text>
+                  <Text style={[styles.infoText, selectedTenant.balance > 0 ? styles.balanceDue : styles.balancePaid]}>
+                    Current Balance: KES {selectedTenant.balance.toLocaleString()}
+                  </Text>
+                </View>
+                
+                <TouchableOpacity style={styles.cancelStepButton} onPress={cancelManualSelection}>
+                  <Text style={styles.cancelStepButtonText}>Cancel Selection</Text>
+                </TouchableOpacity>
+              </>
+            )}
+            
             <TextInput
               style={styles.input}
               placeholder="Amount (KES)"
@@ -306,9 +506,20 @@ export default function PaymentsScreen() {
               onChangeText={setAmount}
               keyboardType="numeric"
             />
+            
+            <TouchableOpacity 
+              style={[styles.recordButton, (!selectedTenant || !amount) && styles.disabledButton]}
+              onPress={handleManualRecordPayment}
+              disabled={!selectedTenant || !amount || isLoading}
+            >
+              <Text style={styles.recordButtonText}>
+                {isLoading ? 'Recording...' : 'Record Payment'}
+              </Text>
+            </TouchableOpacity>
           </View>
         )}
 
+        {/* M-PESA SMS PAYMENT */}
         {paymentMethod === 'mpesa' && (
           <View>
             <TextInput
@@ -319,39 +530,23 @@ export default function PaymentsScreen() {
               multiline
               numberOfLines={4}
             />
-            <TouchableOpacity style={styles.parseButton} onPress={handleMpesaPaste}>
-              <Text style={styles.parseButtonText}>Extract Details</Text>
-            </TouchableOpacity>
-            {amount && (
-              <View style={styles.extractedInfo}>
-                <Text style={styles.extractedText}>Amount: KES {amount}</Text>
-                {mpesaCode && <Text style={styles.extractedText}>Code: {mpesaCode}</Text>}
-              </View>
-            )}
+            
+            <View style={styles.buttonRow}>
+              <TouchableOpacity style={styles.parseButton} onPress={handleMpesaPaste}>
+                <Text style={styles.parseButtonText}>Extract & Guide Me</Text>
+              </TouchableOpacity>
+              
+              {mpesaText && (
+                <TouchableOpacity style={styles.cancelStepButtonSmall} onPress={cancelMpesaFlow}>
+                  <Text style={styles.cancelStepButtonText}>Cancel</Text>
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
         )}
       </View>
 
-      {/* Record Button */}
-      <TouchableOpacity 
-        style={[styles.recordButton, (!amount) && styles.disabledButton]}
-        onPress={handleRecordPayment}
-        disabled={!amount || isLoading}
-      >
-        <Text style={styles.recordButtonText}>
-          {isLoading ? 'Recording...' : 'Record Payment'}
-        </Text>
-      </TouchableOpacity>
-
-      {/* Test SMS Button */}
-      <TouchableOpacity 
-        style={styles.testSMSButton}
-        onPress={() => setShowTestSMS(true)}
-      >
-        <Text style={styles.testSMSButtonText}>📱 Test SMS Parser</Text>
-      </TouchableOpacity>
-
-      {/* Tenant Selector Modal */}
+      {/* Tenant Selector Modal (Manual) */}
       <Modal visible={showTenantSelector} animationType="slide" transparent={true}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
@@ -375,75 +570,297 @@ export default function PaymentsScreen() {
         </View>
       </Modal>
 
-      {/* Test SMS Modal */}
-      <Modal visible={showTestSMS} animationType="slide" transparent={true}>
+      {/* Room Candidates Modal */}
+      <Modal visible={showCandidatesModal} transparent={true} animationType="slide">
         <View style={styles.modalOverlay}>
-          <View style={[styles.modalContent, { maxHeight: '70%' }]}>
-            <Text style={styles.modalTitle}>Test SMS Parser</Text>
-            <TextInput
-              style={[styles.input, styles.textArea]}
-              placeholder="Paste your M-Pesa SMS here..."
-              value={mpesaText}
-              onChangeText={setMpesaText}
-              multiline
-              numberOfLines={5}
-            />
-            <TouchableOpacity style={styles.parseButton} onPress={() => {
-              handleMpesaPaste();
-              setShowTestSMS(false);
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Identify Room Number</Text>
+              <TouchableOpacity onPress={() => {
+                setShowCandidatesModal(false);
+                cancelMpesaFlow();
+              }} style={styles.modalCloseButton}>
+                <Text style={styles.modalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.modalSubtitle}>
+              Extracted: "{extractedData?.fullAccountString || 'Unknown'}"
+            </Text>
+            <Text style={styles.modalQuestion}>Which part represents the room number?</Text>
+            
+            {roomCandidates.map((candidate, index) => (
+              <TouchableOpacity
+                key={index}
+                style={styles.candidateButton}
+                onPress={() => handleSelectRoomCandidate(candidate)}
+              >
+                <Text style={styles.candidateText}>{candidate.description}</Text>
+              </TouchableOpacity>
+            ))}
+            
+            <TouchableOpacity style={styles.cancelModalButton} onPress={() => {
+              setShowCandidatesModal(false);
+              saveToUnmatched();
             }}>
-              <Text style={styles.parseButtonText}>Parse SMS</Text>
+              <Text style={styles.cancelModalButtonText}>Save to Unmatched Instead</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.closeButton} onPress={() => setShowTestSMS(false)}>
-              <Text style={styles.closeButtonText}>Close</Text>
+            
+            <TouchableOpacity style={styles.cancelStepButton} onPress={() => {
+              setShowCandidatesModal(false);
+              cancelMpesaFlow();
+            }}>
+              <Text style={styles.cancelStepButtonText}>Cancel Payment</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
+
+      {/* Property Selector Modal */}
+      <Modal visible={showPropertySelector} transparent={true} animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Multiple Properties Found</Text>
+              <TouchableOpacity onPress={() => {
+                setShowPropertySelector(false);
+                cancelMpesaFlow();
+              }} style={styles.modalCloseButton}>
+                <Text style={styles.modalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.modalSubtitle}>
+              Room "{selectedRoomValue}" exists in multiple properties. Select the correct one:
+            </Text>
+            
+            {matchedTenants.map((tenant) => (
+              <TouchableOpacity
+                key={tenant.id}
+                style={styles.propertyOption}
+                onPress={() => handleSelectProperty(tenant)}
+              >
+                <Text style={styles.propertyName}>{tenant.propertyName || 'Unknown Property'}</Text>
+                <Text style={styles.propertyDetails}>
+                  {tenant.name} • Rent: KES {tenant.monthlyRent.toLocaleString()} • Balance: KES {tenant.balance.toLocaleString()}
+                </Text>
+              </TouchableOpacity>
+            ))}
+            
+            <TouchableOpacity style={styles.cancelStepButton} onPress={() => {
+              setShowPropertySelector(false);
+              cancelMpesaFlow();
+            }}>
+              <Text style={styles.cancelStepButtonText}>Cancel Payment</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Confirmation Modal */}
+      <Modal visible={confirmationVisible} transparent={true} animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Confirm Payment</Text>
+              <TouchableOpacity onPress={() => setConfirmationVisible(false)} style={styles.modalCloseButton}>
+                <Text style={styles.modalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+            
+            {paymentToConfirm && (
+              <View>
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Tenant:</Text>
+                  <Text style={styles.confirmValue}>{paymentToConfirm.tenant.name}</Text>
+                </View>
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Property:</Text>
+                  <Text style={styles.confirmValue}>{paymentToConfirm.tenant.propertyName || 'N/A'}</Text>
+                </View>
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Room:</Text>
+                  <Text style={styles.confirmValue}>{paymentToConfirm.tenant.roomCode}</Text>
+                </View>
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Amount:</Text>
+                  <Text style={styles.confirmValue}>KES {paymentToConfirm.amount.toLocaleString()}</Text>
+                </View>
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>Current Balance:</Text>
+                  <Text style={styles.confirmValue}>KES {paymentToConfirm.tenant.balance.toLocaleString()}</Text>
+                </View>
+                <View style={styles.confirmRow}>
+                  <Text style={styles.confirmLabel}>New Balance:</Text>
+                  <Text style={[styles.confirmValue, styles.newBalance]}>KES {paymentToConfirm.newBalance.toLocaleString()}</Text>
+                </View>
+                {paymentToConfirm.transactionCode && (
+                  <View style={styles.confirmRow}>
+                    <Text style={styles.confirmLabel}>Transaction:</Text>
+                    <Text style={styles.confirmValue}>{paymentToConfirm.transactionCode}</Text>
+                  </View>
+                )}
+              </View>
+            )}
+            
+            <View style={styles.modalButtons}>
+              <TouchableOpacity style={styles.cancelModalButton} onPress={() => setConfirmationVisible(false)}>
+                <Text style={styles.cancelModalButtonText}>Back</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.confirmButton} onPress={saveConfirmedPayment}>
+                <Text style={styles.confirmButtonText}>Confirm & Save</Text>
+              </TouchableOpacity>
+            </View>
+            
+            <TouchableOpacity style={styles.cancelStepButton} onPress={() => {
+              setConfirmationVisible(false);
+              cancelMpesaFlow();
+            }}>
+              <Text style={styles.cancelStepButtonText}>Cancel Entire Payment</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {isLoading && (
+        <View style={styles.loadingOverlay}>
+          <ActivityIndicator size="large" color="#27ae60" />
+        </View>
+      )}
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f5f5f5' },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, backgroundColor: 'white', borderBottomWidth: 1, borderBottomColor: '#e0e0e0' },
+  container: { flex: 1, backgroundColor: '#f8f9fa' },
+  header: { 
+    flexDirection: 'row', 
+    justifyContent: 'space-between', 
+    alignItems: 'center', 
+    padding: 20, 
+    backgroundColor: 'white', 
+    borderBottomWidth: 1, 
+    borderBottomColor: '#e9ecef',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
+    elevation: 3,
+  },
   backButton: { padding: 5 },
-  backText: { fontSize: 16, color: '#27ae60' },
-  title: { fontSize: 18, fontWeight: 'bold', color: '#2c3e50' },
-  card: { backgroundColor: 'white', borderRadius: 12, padding: 15, margin: 15, marginTop: 10, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 2, elevation: 2 },
-  label: { fontSize: 16, fontWeight: '600', color: '#2c3e50', marginBottom: 10 },
-  selectorButton: { borderWidth: 1, borderColor: '#ddd', borderRadius: 8, padding: 12, backgroundColor: '#fff' },
+  backText: { fontSize: 16, color: '#27ae60', fontWeight: '500' },
+  title: { fontSize: 20, fontWeight: 'bold', color: '#2c3e50' },
+  card: { 
+    backgroundColor: 'white', 
+    borderRadius: 16, 
+    padding: 20, 
+    margin: 16, 
+    marginTop: 12,
+    shadowColor: '#000', 
+    shadowOffset: { width: 0, height: 2 }, 
+    shadowOpacity: 0.08, 
+    shadowRadius: 4, 
+    elevation: 3,
+  },
+  label: { fontSize: 16, fontWeight: '600', color: '#2c3e50', marginBottom: 12 },
+  selectorButton: { 
+    borderWidth: 1, 
+    borderColor: '#dee2e6', 
+    borderRadius: 12, 
+    padding: 14, 
+    backgroundColor: '#fff', 
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 1,
+  },
   selectorText: { fontSize: 16, color: '#2c3e50' },
-  selectedInfo: { marginTop: 12, paddingTop: 12, borderTopWidth: 1, borderTopColor: '#eee' },
-  infoText: { fontSize: 14, color: '#7f8c8d', marginBottom: 4 },
-  rentText: { fontWeight: '600', color: '#27ae60' },
-  tabContainer: { flexDirection: 'row', marginBottom: 15 },
-  tab: { flex: 1, padding: 10, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: '#ddd' },
-  activeTab: { borderBottomColor: '#27ae60' },
-  tabText: { fontSize: 14, color: '#95a5a6' },
-  activeTabText: { color: '#27ae60', fontWeight: '600' },
-  input: { borderWidth: 1, borderColor: '#ddd', borderRadius: 8, padding: 12, fontSize: 16, marginBottom: 12 },
-  textArea: { height: 100, textAlignVertical: 'top' },
-  parseButton: { backgroundColor: '#3498db', padding: 12, borderRadius: 8, alignItems: 'center', marginBottom: 12 },
-  parseButtonText: { color: 'white', fontWeight: '600' },
-  extractedInfo: { backgroundColor: '#e8f5e9', padding: 10, borderRadius: 8 },
-  extractedText: { fontSize: 14, color: '#2c3e50' },
-  recordButton: { backgroundColor: '#27ae60', margin: 15, padding: 15, borderRadius: 8, alignItems: 'center' },
-  disabledButton: { backgroundColor: '#95a5a6' },
+  selectedInfo: { 
+    marginTop: 12, 
+    padding: 12, 
+    backgroundColor: '#f8f9fa', 
+    borderRadius: 12,
+    marginBottom: 12,
+  },
+  infoText: { fontSize: 14, color: '#6c757d', marginBottom: 6 },
+  tabContainer: { flexDirection: 'row', marginBottom: 20, backgroundColor: '#f8f9fa', borderRadius: 12, padding: 4 },
+  tab: { flex: 1, padding: 12, alignItems: 'center', borderRadius: 10 },
+  activeTab: { backgroundColor: '#27ae60' },
+  tabText: { fontSize: 14, color: '#6c757d', fontWeight: '500' },
+  activeTabText: { color: 'white', fontWeight: '600' },
+  input: { 
+    borderWidth: 1, 
+    borderColor: '#dee2e6', 
+    borderRadius: 12, 
+    padding: 14, 
+    fontSize: 16, 
+    marginBottom: 12,
+    backgroundColor: '#fff',
+  },
+  textArea: { height: 120, textAlignVertical: 'top' },
+  parseButton: { 
+    backgroundColor: '#3498db', 
+    padding: 15, 
+    borderRadius: 12, 
+    alignItems: 'center',
+    flex: 1,
+    marginRight: 8,
+  },
+  parseButtonText: { color: 'white', fontWeight: '600', fontSize: 16 },
+  recordButton: { backgroundColor: '#27ae60', padding: 16, borderRadius: 12, alignItems: 'center', marginTop: 8 },
+  disabledButton: { backgroundColor: '#adb5bd' },
   recordButtonText: { color: 'white', fontSize: 16, fontWeight: '600' },
-  testSMSButton: { backgroundColor: '#3498db', margin: 15, marginTop: 0, padding: 12, borderRadius: 8, alignItems: 'center' },
-  testSMSButtonText: { color: 'white', fontWeight: '600', fontSize: 14 },
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
-  modalContent: { backgroundColor: 'white', borderRadius: 12, padding: 20, width: '90%', maxHeight: '80%' },
-  modalTitle: { fontSize: 20, fontWeight: 'bold', marginBottom: 15, textAlign: 'center' },
-  searchInput: { borderWidth: 1, borderColor: '#ddd', borderRadius: 8, padding: 10, marginBottom: 15, fontSize: 16 },
-  tenantList: { maxHeight: 400 },
-  tenantItem: { padding: 12, borderBottomWidth: 1, borderBottomColor: '#eee' },
-  tenantItemName: { fontSize: 16, fontWeight: '600', color: '#2c3e50' },
-  tenantItemDetails: { fontSize: 12, color: '#7f8c8d', marginTop: 2 },
-  tenantItemBalance: { fontSize: 14, fontWeight: '500', marginTop: 4 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center' },
+  modalContent: { backgroundColor: 'white', borderRadius: 20, padding: 24, width: '90%', maxHeight: '85%' },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
+  modalTitle: { fontSize: 22, fontWeight: 'bold', color: '#2c3e50', textAlign: 'center', flex: 1 },
+  modalCloseButton: { padding: 8, width: 36, height: 36, alignItems: 'center', justifyContent: 'center' },
+  modalCloseText: { fontSize: 20, color: '#6c757d', fontWeight: 'bold' },
+  modalSubtitle: { fontSize: 14, color: '#6c757d', textAlign: 'center', marginBottom: 16 },
+  modalQuestion: { fontSize: 16, fontWeight: '600', marginBottom: 16, color: '#2c3e50' },
+  candidateButton: { backgroundColor: '#f8f9fa', padding: 14, borderRadius: 12, marginBottom: 10, borderWidth: 1, borderColor: '#e9ecef' },
+  candidateText: { fontSize: 16, color: '#2c3e50', textAlign: 'center' },
+  propertyOption: { padding: 14, borderBottomWidth: 1, borderBottomColor: '#e9ecef' },
+  propertyName: { fontSize: 16, fontWeight: '600', color: '#2c3e50', marginBottom: 4 },
+  propertyDetails: { fontSize: 13, color: '#6c757d' },
+  confirmRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+  confirmLabel: { fontSize: 14, color: '#6c757d' },
+  confirmValue: { fontSize: 14, fontWeight: '500', color: '#2c3e50' },
+  newBalance: { color: '#27ae60', fontWeight: 'bold', fontSize: 16 },
+  modalButtons: { flexDirection: 'row', gap: 12, marginTop: 20 },
+  cancelModalButton: { flex: 1, padding: 14, borderRadius: 12, alignItems: 'center', backgroundColor: '#f8f9fa', borderWidth: 1, borderColor: '#e9ecef' },
+  cancelModalButtonText: { color: '#6c757d', fontWeight: '600' },
+  confirmButton: { flex: 1, padding: 14, borderRadius: 12, alignItems: 'center', backgroundColor: '#27ae60' },
+  confirmButtonText: { color: 'white', fontWeight: '600', fontSize: 15 },
+  loadingOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
+  searchInput: { borderWidth: 1, borderColor: '#dee2e6', borderRadius: 12, padding: 12, marginBottom: 16, fontSize: 16 },
+  tenantList: { maxHeight: 500 },
+  tenantItem: { padding: 14, borderBottomWidth: 1, borderBottomColor: '#e9ecef' },
+  tenantItemName: { fontSize: 16, fontWeight: '600', color: '#2c3e50', marginBottom: 4 },
+  tenantItemDetails: { fontSize: 13, color: '#6c757d', marginBottom: 4 },
+  tenantItemBalance: { fontSize: 14, fontWeight: '500', marginTop: 2 },
   balanceDue: { color: '#e74c3c' },
   balancePaid: { color: '#27ae60' },
-  closeButton: { marginTop: 15, padding: 12, alignItems: 'center', backgroundColor: '#ecf0f1', borderRadius: 8 },
-  closeButtonText: { color: '#7f8c8d', fontWeight: '600' },
+  closeButton: { marginTop: 16, padding: 14, alignItems: 'center', backgroundColor: '#f8f9fa', borderRadius: 12 },
+  closeButtonText: { color: '#6c757d', fontWeight: '600' },
+  cancelStepButton: { 
+    marginTop: 12, 
+    padding: 12, 
+    alignItems: 'center', 
+    backgroundColor: '#fff', 
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#dc3545',
+  },
+  cancelStepButtonText: { color: '#dc3545', fontWeight: '600', fontSize: 14 },
+  buttonRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  cancelStepButtonSmall: { 
+    padding: 15, 
+    alignItems: 'center', 
+    backgroundColor: '#fff', 
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#dc3545',
+    paddingHorizontal: 20,
+  },
 });
